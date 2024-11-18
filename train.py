@@ -19,26 +19,28 @@ class Train:
         observation, info = self.env.reset()
         with open("config.yaml") as f:
             self.cfg = yaml.load(f, Loader=yaml.FullLoader)
-        
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.logger = logger_helper()
         self.actor = Actor(self.env.observation_space.shape[0], self.env.action_space.n)
         self.critic = Critic(self.env.observation_space.shape[0])
-        
+         
 
     def run(self):
         torch.manual_seed(self.cfg['train']['random_seed'])
         actor_optim = optim.Adam(self.actor.parameters(), lr=self.cfg['train']['lr'], betas=self.cfg['train']['betas'])
         critic_optim = optim.Adam(self.critic.parameters(), lr=self.cfg['train']['lr'], betas=self.cfg['train']['betas'])
-        actor_losses = []
         avg_actor_losses = []
-        critic_losses = []
         avg_critic_losses = []
+        actor_losses = []
+        critic_losses = []
         eps = np.finfo(np.float32).eps.item()
+        batch_data = []
         for episode in range(self.cfg['train']['n_epidode']):
             rewards = []
             log_probs = []
             actions = []
             states = []
+            state_values = []
 
             state = self.env.reset()
             # Converted to tensor
@@ -66,6 +68,10 @@ class Train:
                 # Get the log probability to get log pi_theta(a|s) and save it to a list.
                 log_probs.append(action_dist.log_prob(action))
 
+                # Compute the current state-value 
+                v_st = self.critic(state)
+                state_values.append(v_st)
+
                 states.append(state)
 
                 # Action has to convert from tensor to numpy for env to process
@@ -81,8 +87,6 @@ class Train:
                     break
 
             R = 0
-            actor_loss_list = [] # list to save actor (policy) loss
-            critic_loss_list = [] # list to save critic (value) loss
             returns = [] # list to save the true values
 
             # Calculate the return of each episode using rewards returned from the environment in the episode
@@ -93,56 +97,59 @@ class Train:
 
             returns = torch.tensor(returns)
             returns = (returns - returns.mean()) / (returns.std() + eps)
-            
-            # Optimize the model
-            for old_logprobs, state, action, R in zip(log_probs, states, actions, returns):
-                
-                # Compute the current state-value v_s_t
-                state_value = self.critic(state)
 
-                # Advantage is calculated by the difference between actual return of current stateand estimated return of current state(v_st)
-                advantage = torch.FloatTensor(R - state_value.item())
+            # Store the data
+            batch_data.append([states, actions, returns, log_probs, state_values])
 
-                # Now we need to compute the ratio (pi_theta / pi_theta__old). In order to do that, we need to get old policy of the 
-                # action taken from the state which is stored and compute the new policy of the same action
-                # The actor layer output the action probability as the actor NN has softmax in the output layer
-                action_prob = self.actor(state)
-                action_dist= Categorical(action_prob)
-                new_logprob = action_dist.log_prob(action)
+            if episode != 0 and episode%self.cfg['train']['update_freq'] == 0:
+                for states_b, actions_b, returns_b, old_log_probs, state_values in batch_data:
+                    
+                    # convert list to tensor
+                    old_states = torch.stack(states_b, dim=0).detach()
+                    old_actions = torch.stack(actions_b, dim=0).detach()
+                    old_log_probs = torch.stack(old_log_probs, dim=0).detach()
+                    old_state_values = torch.stack(state_values, dim=0).detach()
 
-                # Because we are taking log, we can substract instead division. Then taking the exponents will give the same result as division
-                ratio = torch.exp(new_logprob - old_logprobs)
-                
-                # Unclipped part of the surrogate loss function
-                surr1 = ratio * advantage
+                    # calculate advantages
+                    advantages = returns_b.detach() - old_state_values.detach()
 
-                # Clipped part of the surrogate loss function
-                surr2 = torch.clamp(ratio, 1 - self.cfg['train']['clip_param'], 1 + self.cfg['train']['clip_param']) * advantage
+                    # Now we need to compute the ratio (pi_theta / pi_theta__old). In order to do that, we need to get old policy of the 
+                    # action taken from the state which is stored and compute the new policy of the same action
+                    # The actor layer output the action probability as the actor NN has softmax in the output layer
+                    action_probs = self.actor(old_states)
+                    dist = Categorical(action_probs)
+                    new_log_probs = dist.log_prob(old_actions)
+                    
+                    # Because we are taking log, we can substract instead division. Then taking the exponents will give the same result as division
+                    ratios = torch.exp(new_log_probs - old_log_probs)
+                    
+                    # Unclipped part of the surrogate loss function
+                    surr1 = ratios * advantages
 
-                # Update actor network: loss = min(surr1, surr2)
-                a_loss = -torch.min(surr1, surr2).mean()
-                actor_loss_list.append(a_loss)
+                    # Clipped part of the surrogate loss function
+                    surr2 = torch.clamp(ratios, 1 - self.cfg['train']['clip_param'], 1 + self.cfg['train']['clip_param']) * advantages
 
-                # Calculate critic (value) loss using huber loss
-                # Huber loss, which is less sensitive to outliers in data than squared-error loss. In value based RL ssetup, huber loss is preferred.
-                # Smooth L1 loss is closely related to HuberLoss
-                c_loss =  F.smooth_l1_loss(state_value, torch.tensor([R])) #F.huber_loss(state_value, torch.tensor([R]))
-                critic_loss_list.append(c_loss)
+                    # Update actor network: loss = min(surr1, surr2)
+                    actor_loss = -torch.min(surr1, surr2).mean()
+                    actor_losses.append(actor_loss.item())
+                    
+                    # Calculate critic (value) loss using huber loss
+                    # Huber loss, which is less sensitive to outliers in data than squared-error loss. In value based RL ssetup, huber loss is preferred.
+                    # Smooth L1 loss is closely related to HuberLoss
+                    critic_loss =  F.smooth_l1_loss(old_state_values, returns_b.unsqueeze(1)) #F.huber_loss(state_value, torch.tensor([R]))
+                    critic_loss.requires_grad = True
+                    critic_losses.append(critic_loss.item())
 
-            # Sum up all the values of actor_losses(policy_losses) and critic_loss(value_losses)
-            actor_loss = torch.stack(actor_loss_list).sum()
-            critic_loss = torch.stack(critic_loss_list).sum()
-
-            # Perform backprop
-            actor_loss.backward()
-            critic_loss.backward()
-            
-            # Perform optimization
-            actor_optim.step()
-            critic_optim.step()
+                    # Perform backprop
+                    actor_loss.backward()
+                    critic_loss.backward()
+                    
+                    # Perform optimization
+                    actor_optim.step()
+                    critic_optim.step()
 
             # Storing average losses for plotting
-            if episode%50 == 0:
+            if episode%self.cfg['train']['store_plotting_data'] == 0:
                 avg_actor_losses.append(np.mean(actor_losses))
                 avg_critic_losses.append(np.mean(critic_losses))
                 actor_losses = []
@@ -150,7 +157,7 @@ class Train:
             else:
                 actor_losses.append(actor_loss.detach().numpy())
                 critic_losses.append((critic_loss.detach().numpy()))
-
+        
         plt.figure(figsize=(10,6))
         plt.xlabel("X-axis")  # add X-axis label
         plt.ylabel("Y-axis")  # add Y-axis label
