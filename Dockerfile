@@ -8,6 +8,7 @@ RUN pip install numpy~=1.26.2
 RUN pip install pandas~=2.1.3
 RUN pip install gymnasium
 RUN pip install PyYAML
+RUN pip install lightning
 
 WORKDIR /app
 
