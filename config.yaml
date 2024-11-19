@@ -7,7 +7,7 @@ train:
     - 0.9
     - 0.999
   random_seed: 543
-  n_epidode: 5000
+  n_epidode: 2000
   n_timesteps: 2000
   clip_param: 0.2
   update_freq: 4 # 2nd episode

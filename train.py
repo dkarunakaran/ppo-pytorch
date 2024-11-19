@@ -41,7 +41,7 @@ class Train:
             log_probs = []
             actions = []
             states = []
-            state_values = []
+            #state_values = []
             self.actor.train()
             self.critic.train()
             terminated, truncated = False, False # initiate the terminated and truncated flags
@@ -74,8 +74,8 @@ class Train:
                 log_probs.append(action_dist.log_prob(action))
 
                 # Compute the current state-value 
-                v_st = self.critic(state)
-                state_values.append(v_st)
+                #v_st = self.critic(state)
+                #state_values.append(v_st)
 
                 states.append(state)
 
@@ -104,19 +104,18 @@ class Train:
             returns = (returns - returns.mean()) / (returns.std() + eps)
 
             # Store the data
-            batch_data.append([states, actions, returns, log_probs, state_values])
+            batch_data.append([states, actions, returns, log_probs])
 
             if episode != 0 and episode%self.cfg['train']['update_freq'] == 0:
                 # This is the loop where we update our network for some n epochs.This additonal for loops
                 # improved the training
                 for _ in range(5):
-                    for states_b, actions_b, returns_b, old_log_probs, old_state_values in batch_data:
+                    for states_b, actions_b, returns_b, old_log_probs in batch_data:
                         
-                        # convert list to tensor
+                        # Convert list to tensor
                         old_states = torch.stack(states_b, dim=0).detach()
                         old_actions = torch.stack(actions_b, dim=0).detach()
                         old_log_probs = torch.stack(old_log_probs, dim=0).detach()
-                        #old_state_values = torch.stack(old_state_values, dim=0).detach()
 
                         state_values = self.critic(old_states)
 
