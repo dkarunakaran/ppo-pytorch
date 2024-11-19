@@ -7,8 +7,8 @@ train:
     - 0.9
     - 0.999
   random_seed: 543
-  n_epidode: 1200
+  n_epidode: 5000
   n_timesteps: 2000
   clip_param: 0.2
-  update_freq: 1 # 4th episode
-  store_plotting_data: 50
+  update_freq: 4 # 2nd episode
+  store_plotting_data: 5

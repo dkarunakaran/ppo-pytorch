@@ -17,12 +17,13 @@ class Train:
         self.random_seed = 543
         self.env = gym.make('CartPole-v1')
         observation, info = self.env.reset()
+        self.logger = logger_helper()
         with open("config.yaml") as f:
             self.cfg = yaml.load(f, Loader=yaml.FullLoader)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.logger = logger_helper()
-        self.actor = Actor(self.env.observation_space.shape[0], self.env.action_space.n)
-        self.critic = Critic(self.env.observation_space.shape[0])
+        self.logger.info(f"Device is: {self.device}")
+        self.actor = Actor(self.env.observation_space.shape[0], self.env.action_space.n).to(self.device)
+        self.critic = Critic(self.env.observation_space.shape[0]).to(self.device)
          
 
     def run(self):
@@ -41,15 +42,19 @@ class Train:
             actions = []
             states = []
             state_values = []
-
-            state = self.env.reset()
+            self.actor.train()
+            self.critic.train()
+            terminated, truncated = False, False # initiate the terminated and truncated flags
+            state, info = self.env.reset()
             # Converted to tensor
-            state = torch.FloatTensor(state[0])
+            state = torch.FloatTensor(state).to(self.device)
             self.logger.info(f"--------Episode: {episode} started----------")
-            actor_optim.zero_grad()
-            critic_optim.zero_grad()
+            timesteps = 0
             # loop through timesteps
-            for i in range(self.cfg['train']['n_timesteps']):
+            #for i in range(self.cfg['train']['n_timesteps']):
+            while not terminated and not truncated:
+                timesteps += 1
+
                 # The actor layer output the action probability as the actor NN has softmax in the output layer
                 action_prob = self.actor(state)
 
@@ -75,15 +80,15 @@ class Train:
                 states.append(state)
 
                 # Action has to convert from tensor to numpy for env to process
-                next_state, reward, done, _, _= self.env.step(action.detach().numpy())
+                next_state, reward, terminated, truncated, info = self.env.step(action.item())
                 rewards.append(reward)
 
                 # Assign next state as current state
-                state = torch.FloatTensor(next_state) 
+                state = torch.FloatTensor(next_state).to(self.device)
 
                 # Enviornment return done == true if the current episode is terminated
-                if done:
-                    self.logger.info('Iteration: {}, Score: {}'.format(episode, i))
+                if terminated or truncated:
+                    self.logger.info('Iteration: {}, Score: {}'.format(episode, timesteps))
                     break
 
             R = 0
@@ -95,58 +100,73 @@ class Train:
                 R = r + self.cfg['train']['gamma'] * R
                 returns.insert(0, R)
 
-            returns = torch.tensor(returns)
+            returns = torch.tensor(returns).to(self.device)
             returns = (returns - returns.mean()) / (returns.std() + eps)
 
             # Store the data
             batch_data.append([states, actions, returns, log_probs, state_values])
 
             if episode != 0 and episode%self.cfg['train']['update_freq'] == 0:
-                for states_b, actions_b, returns_b, old_log_probs, state_values in batch_data:
-                    
-                    # convert list to tensor
-                    old_states = torch.stack(states_b, dim=0).detach()
-                    old_actions = torch.stack(actions_b, dim=0).detach()
-                    old_log_probs = torch.stack(old_log_probs, dim=0).detach()
-                    old_state_values = torch.stack(state_values, dim=0).detach()
+                # This is the loop where we update our network for some n epochs.This additonal for loops
+                # improved the training
+                for _ in range(5):
+                    for states_b, actions_b, returns_b, old_log_probs, old_state_values in batch_data:
+                        
+                        # convert list to tensor
+                        old_states = torch.stack(states_b, dim=0).detach()
+                        old_actions = torch.stack(actions_b, dim=0).detach()
+                        old_log_probs = torch.stack(old_log_probs, dim=0).detach()
+                        #old_state_values = torch.stack(old_state_values, dim=0).detach()
 
-                    # calculate advantages
-                    advantages = returns_b.detach() - old_state_values.detach()
+                        state_values = self.critic(old_states)
 
-                    # Now we need to compute the ratio (pi_theta / pi_theta__old). In order to do that, we need to get old policy of the 
-                    # action taken from the state which is stored and compute the new policy of the same action
-                    # The actor layer output the action probability as the actor NN has softmax in the output layer
-                    action_probs = self.actor(old_states)
-                    dist = Categorical(action_probs)
-                    new_log_probs = dist.log_prob(old_actions)
-                    
-                    # Because we are taking log, we can substract instead division. Then taking the exponents will give the same result as division
-                    ratios = torch.exp(new_log_probs - old_log_probs)
-                    
-                    # Unclipped part of the surrogate loss function
-                    surr1 = ratios * advantages
+                        # calculate advantages
+                        advantages = returns_b.detach() - state_values.detach()
 
-                    # Clipped part of the surrogate loss function
-                    surr2 = torch.clamp(ratios, 1 - self.cfg['train']['clip_param'], 1 + self.cfg['train']['clip_param']) * advantages
+                        # Ref: https://github.com/ericyangyu/PPO-for-Beginners/blob/master/ppo.py
+                        # Normalizing advantages isn't theoretically necessary, but in practice it decreases the variance of 
+                        # our advantages and makes convergence much more stable and faster. I added this because
+                        # solving some environments was too unstable without it.
+                        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-10)
 
-                    # Update actor network: loss = min(surr1, surr2)
-                    actor_loss = -torch.min(surr1, surr2).mean()
-                    actor_losses.append(actor_loss.item())
-                    
-                    # Calculate critic (value) loss using huber loss
-                    # Huber loss, which is less sensitive to outliers in data than squared-error loss. In value based RL ssetup, huber loss is preferred.
-                    # Smooth L1 loss is closely related to HuberLoss
-                    critic_loss =  F.smooth_l1_loss(old_state_values, returns_b.unsqueeze(1)) #F.huber_loss(state_value, torch.tensor([R]))
-                    critic_loss.requires_grad = True
-                    critic_losses.append(critic_loss.item())
+                        # Now we need to compute the ratio (pi_theta / pi_theta__old). In order to do that, we need to get old policy of the 
+                        # action taken from the state which is stored and compute the new policy of the same action
+                        # The actor layer output the action probability as the actor NN has softmax in the output layer
+                        action_probs = self.actor(old_states)
+                        dist = Categorical(action_probs)
+                        new_log_probs = dist.log_prob(old_actions)
+                        # Because we are taking log, we can substract instead division. Then taking the exponents will give the same result as division
+                        ratios = torch.exp(new_log_probs - old_log_probs)
+                        
+                        # Unclipped part of the surrogate loss function
+                        surr1 = ratios * advantages
 
-                    # Perform backprop
-                    actor_loss.backward()
-                    critic_loss.backward()
-                    
-                    # Perform optimization
-                    actor_optim.step()
-                    critic_optim.step()
+                        # Clipped part of the surrogate loss function
+                        surr2 = torch.clamp(ratios, 1 - self.cfg['train']['clip_param'], 1 + self.cfg['train']['clip_param']) * advantages
+
+                        # Update actor network: loss = min(surr1, surr2)
+                        actor_loss = -torch.min(surr1, surr2).mean()
+                        actor_losses.append(actor_loss.item())
+                        
+                        # Calculate critic (value) loss using huber loss
+                        # Huber loss, which is less sensitive to outliers in data than squared-error loss. In value based RL ssetup, huber loss is preferred.
+                        # Smooth L1 loss is closely related to HuberLoss
+                        critic_loss =  F.smooth_l1_loss(state_values, returns_b.unsqueeze(1)) #F.huber_loss(state_value, torch.tensor([R]))
+                        critic_losses.append(critic_loss.item())
+
+                        actor_optim.zero_grad()
+                        critic_optim.zero_grad()
+
+                        # Perform backprop
+                        actor_loss.backward()
+                        critic_loss.backward()
+                        
+                        # Perform optimization
+                        actor_optim.step()
+                        critic_optim.step()
+
+                # Clear the data
+                batch_data = []
 
             # Storing average losses for plotting
             if episode%self.cfg['train']['store_plotting_data'] == 0:
@@ -154,9 +174,6 @@ class Train:
                 avg_critic_losses.append(np.mean(critic_losses))
                 actor_losses = []
                 critic_losses = []
-            else:
-                actor_losses.append(actor_loss.detach().numpy())
-                critic_losses.append((critic_loss.detach().numpy()))
         
         plt.figure(figsize=(10,6))
         plt.xlabel("X-axis")  # add X-axis label
